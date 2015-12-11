@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2015 The Android Open Source Project
+ * Copyright (C) 2015-2018 The MoKee Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +48,8 @@ import android.text.style.TextAppearanceSpan;
 
 import com.android.messaging.Factory;
 import com.android.messaging.R;
+import com.android.messaging.datamodel.DatabaseHelper.ConversationColumns;
+import com.android.messaging.datamodel.DatabaseHelper.PartColumns;
 import com.android.messaging.datamodel.MessageNotificationState.BundledMessageNotificationState;
 import com.android.messaging.datamodel.MessageNotificationState.ConversationLineInfo;
 import com.android.messaging.datamodel.MessageNotificationState.MultiConversationNotificationState;
@@ -62,6 +65,7 @@ import com.android.messaging.datamodel.media.MediaResourceManager;
 import com.android.messaging.datamodel.media.MessagePartVideoThumbnailRequestDescriptor;
 import com.android.messaging.datamodel.media.UriImageRequestDescriptor;
 import com.android.messaging.datamodel.media.VideoThumbnailRequest;
+import com.android.messaging.receiver.CaptchaReceiver;
 import com.android.messaging.sms.MmsSmsUtils;
 import com.android.messaging.sms.MmsUtils;
 import com.android.messaging.ui.UIIntents;
@@ -81,6 +85,8 @@ import com.android.messaging.util.PendingIntentConstants;
 import com.android.messaging.util.PhoneUtils;
 import com.android.messaging.util.ThreadUtil;
 import com.android.messaging.util.UriUtil;
+import com.mokee.mms.captcha.CaptchaInfo;
+import com.mokee.mms.captcha.CaptchaUtils;
 
 import org.lineageos.messaging.util.NotifUtils;
 
@@ -174,7 +180,7 @@ public class BugleNotifications {
                     + " conversationId = " + conversationId
                     + " coverage = " + coverage);
         }
-    Assert.isNotMainThread();
+        Assert.isNotMainThread();
         checkInitialized();
         if ((coverage & UPDATE_MESSAGES) != 0) {
             createMessageNotification(silent, conversationId);
@@ -788,9 +794,42 @@ public class BugleNotifications {
 
             maybeAddWearableConversationLog(wearableExtender,
                     (MultiMessageNotificationState) notificationState);
-            addDownloadMmsAction(notifBuilder, wearableExtender, notificationState);
-            addReplyAction(notifBuilder, wearableExtender, notificationState);
-            addReadAction(notifBuilder, wearableExtender, notificationState);
+
+            boolean isCaptchaMessage = false;
+            final ConversationLineInfo convInfo =
+                    ((MultiMessageNotificationState) notificationState).mConvList.mConvInfos.get(0);
+            String content = ((MultiMessageNotificationState) notificationState).mContent.toString();
+            String number = convInfo.mSenderNormalizedDestination;
+            CaptchaInfo captchaInfo = CaptchaUtils.getCaptchaInfo(content, number);
+            if (captchaInfo != null) {
+                isCaptchaMessage = true;
+                String captchaTitle = TextUtils.isEmpty(captchaInfo.getProvider())
+                        ? String.format(context.getString(R.string.captcha_title), captchaInfo.getCaptcha())
+                        : String.format(context.getString(R.string.captcha_with_provider_title), captchaInfo.getCaptcha(), captchaInfo.getProvider());
+                notifBuilder.setContentTitle(captchaTitle);
+                notifBuilder.setTicker(captchaTitle);
+                notifBuilder.setContentText(context.getString(R.string.captcha_content));
+
+                final NotificationCompat.Style notifStyle =
+                        new NotificationCompat.BigTextStyle(notifBuilder).bigText(context.getString(R.string.captcha_content));
+                notifBuilder.setStyle(notifStyle);
+
+                Intent pendingIntent = new Intent();
+                pendingIntent.setClass(context, CaptchaReceiver.class);
+                pendingIntent.putExtra("captcha", captchaInfo.getCaptcha());
+                pendingIntent.putExtra(PartColumns.MESSAGE_ID, convInfo.getLatestMessageId());
+                pendingIntent.putExtra(ConversationColumns.SMS_THREAD_ID, notificationState.mConversationIds.first());
+                PendingIntent captchaIntent = PendingIntent.getBroadcast(context, 0, pendingIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT);
+                notifBuilder.setContentIntent(captchaIntent);
+            }
+
+            if (!isCaptchaMessage) {
+                addDownloadMmsAction(notifBuilder, wearableExtender, notificationState);
+                addReplyAction(notifBuilder, wearableExtender, notificationState);
+                addCallAction(notifBuilder, wearableExtender, notificationState);
+                addReadAction(notifBuilder, wearableExtender, notificationState);
+            }
         }
 
         // Apply the wearable options and build & post the notification
@@ -832,6 +871,32 @@ public class BugleNotifications {
         }
     }
 
+    private static void addCallAction(final NotificationCompat.Builder notifBuilder,
+            final WearableExtender wearableExtender, final NotificationState notificationState) {
+        if (!(notificationState instanceof MultiMessageNotificationState)) {
+            return;
+        }
+        final MultiMessageNotificationState multiMessageNotificationState =
+                (MultiMessageNotificationState) notificationState;
+        final Context context = Factory.get().getApplicationContext();
+
+        ConversationLineInfo convInfo = multiMessageNotificationState.mConvList.mConvInfos.get(0);
+        if (TextUtils.isEmpty(convInfo.mSenderNormalizedDestination)) return;
+
+        Intent callIntent = new Intent(Intent.ACTION_CALL,
+                Uri.parse(UriUtil.SCHEME_TEL + convInfo.mSenderNormalizedDestination));
+        final PendingIntent callPendingIntent = PendingIntent.getActivity(context, 0, callIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT);
+
+        final NotificationCompat.Action.Builder actionBuilder =
+                new NotificationCompat.Action.Builder(R.drawable.ic_wear_call,
+                        context.getString(R.string.notification_call), callPendingIntent);
+        notifBuilder.addAction(actionBuilder.build());
+
+        // Support the action on a wearable device as well
+        wearableExtender.addAction(actionBuilder.build());
+    }
+
     private static void addReplyAction(final NotificationCompat.Builder notifBuilder,
             final WearableExtender wearableExtender, final NotificationState notificationState) {
         if (!(notificationState instanceof MultiMessageNotificationState)) {
@@ -856,12 +921,9 @@ public class BugleNotifications {
                 .getPendingIntentForSendingMessageToConversation(context,
                         conversationId, selfId, requiresMms, requestCode);
 
-        final int replyLabelRes = requiresMms ? R.string.notification_reply_via_mms :
-            R.string.notification_reply_via_sms;
-
         final NotificationCompat.Action.Builder actionBuilder =
                 new NotificationCompat.Action.Builder(R.drawable.ic_wear_reply,
-                        context.getString(replyLabelRes), replyPendingIntent);
+                        context.getString(R.string.notification_reply), replyPendingIntent);
         final String[] choices = context.getResources().getStringArray(
                 R.array.notification_reply_choices);
         final RemoteInput remoteInput = new RemoteInput.Builder(Intent.EXTRA_TEXT).setLabel(
